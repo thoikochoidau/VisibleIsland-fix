@@ -80,6 +80,46 @@ static BOOL lineDisabled;
 
 @end
 
+// FIX: Recursively clear opaque black backgrounds from subviews.
+// Apple's private Dynamic Island subviews (glyphs, FaceID icon, waveform, timer)
+// have hardcoded black opaque backgrounds since they assume the island is always black.
+// When a custom color or transparency is applied to the parent, these child
+// black backgrounds become visible as floating black rectangles.
+static void clearOpaqueBlackSubviewBackgrounds(UIView *view) {
+    for (UIView *subview in view.subviews) {
+        // Check UIView backgroundColor
+        if (subview.backgroundColor) {
+            CGFloat r = 0, g = 0, b = 0, a = 0;
+            BOOL success = [subview.backgroundColor getRed:&r green:&g blue:&b alpha:&a];
+            if (success && r < 0.05 && g < 0.05 && b < 0.05 && a > 0.85) {
+                subview.backgroundColor = [UIColor clearColor];
+            }
+        }
+
+        // Check CALayer backgroundColor (some Apple private views set this directly)
+        if (subview.layer.backgroundColor) {
+            size_t numComponents = CGColorGetNumberOfComponents(subview.layer.backgroundColor);
+            if (numComponents >= 4) {
+                const CGFloat *components = CGColorGetComponents(subview.layer.backgroundColor);
+                // components: [R, G, B, A]
+                if (components[0] < 0.05 && components[1] < 0.05 &&
+                    components[2] < 0.05 && components[3] > 0.85) {
+                    subview.layer.backgroundColor = [UIColor clearColor].CGColor;
+                }
+            } else if (numComponents == 2) {
+                // Grayscale color space: components are [White, Alpha]
+                const CGFloat *components = CGColorGetComponents(subview.layer.backgroundColor);
+                if (components[0] < 0.05 && components[1] > 0.85) {
+                    subview.layer.backgroundColor = [UIColor clearColor].CGColor;
+                }
+            }
+        }
+
+        // Recurse into subviews
+        clearOpaqueBlackSubviewBackgrounds(subview);
+    }
+}
+
 %hook SBSystemApertureWindow
 
 - (void)layoutSubviews {
@@ -363,36 +403,95 @@ static BOOL lineDisabled;
 %end
 
 
+// FIX: Black rectangle behind glyph elements (FaceID, timer, audio waveform).
+//
+// ROOT CAUSE: The original code only set backgroundColor when it was nil,
+// meaning it never applied consistently on re-layout. More critically, it
+// applied color to this container view but did NOT clear the opaque black
+// backgrounds on Apple's private child views (glyphs, etc.), which are
+// hardcoded black since Apple assumes the island is always black.
+// When the parent gets a custom color, those child black backgrounds surface
+// as a visible floating black rectangle.
+//
+// FIX:
+//   1. Always set the background color (remove the !backgroundColor guard).
+//   2. Call %orig BEFORE setting color so Apple's layout runs first.
+//   3. After setting color, recurse into subviews and clear any opaque
+//      black child backgrounds so they don't bleed through.
+//   4. Ensure clipsToBounds = YES so nothing renders outside the pill shape.
 
 %hook _SBSystemApertureContainerViewContentView
 
 - (void)layoutSubviews {
-    UIColor *backgroundColor = [self backgroundColor];
-    if (colorEnabled) {
-        if (!backgroundColor) {
-        
-            UIColor *customColor = [[UIColor alloc] initWithRed:red green:green blue:blue alpha:alpha];
-            [self setBackgroundColor:customColor];
-        }
-    }
+    // Run Apple's original layout first so all subviews exist before we patch them
     %orig;
+
+    if (colorEnabled) {
+        // Always apply — remove the old "if (!backgroundColor)" guard which
+        // prevented re-application after subviews were re-added by %orig
+        UIColor *customColor = [[UIColor alloc] initWithRed:red green:green blue:blue alpha:1.0];
+        [self setBackgroundColor:customColor];
+
+        // Clip to the island's pill shape so child views can't bleed outside
+        self.clipsToBounds = YES;
+        self.layer.masksToBounds = YES;
+
+        // Clear opaque black backgrounds on all child views so they don't
+        // render as a black rectangle over the custom color
+        clearOpaqueBlackSubviewBackgrounds(self);
+    }
 }
 
 %end
+
+// FIX: Black rectangle when using transparency (transEnabled).
+//
+// ROOT CAUSE: The original code applied `alpha` to subviews[2] — the island
+// container view. Setting alpha on a parent view makes ALL its children
+// semi-transparent too, but Apple's child glyph views have their own opaque
+// black backgrounds. At partial alpha, the parent composites over screen
+// content, but child black backgrounds are still fully opaque relative to
+// their parent — they become visible as a black rectangle.
+//
+// FIX:
+//   1. Instead of setting alpha on the container, bake alpha into the
+//      backgroundColor using colorWithAlphaComponent: — this makes only the
+//      background color transparent while leaving child views unaffected.
+//   2. Keep the view's alpha at 1.0 so child views don't inherit it.
+//   3. Still call clearOpaqueBlackSubviewBackgrounds so any child black
+//      backgrounds are cleaned up regardless.
 
 %hook SBFTouchPassThroughView
 
 - (void)layoutSubviews {
     %orig;
-    
+
     if (transEnabled) {
         if (self.subviews.count == 4) {
             UIView *targetSubview = self.subviews[2];
-            if (targetSubview.alpha == 1.0 && targetSubview.userInteractionEnabled == 0) {
-                targetSubview.alpha = alpha;
+            if (targetSubview.userInteractionEnabled == 0) {
+                // FIXED: Don't set alpha on the container view itself.
+                // Instead bake alpha into the backgroundColor so only the
+                // background fades — child views keep their own rendering intact.
+                UIColor *baseColor = targetSubview.backgroundColor;
+                if (!baseColor || baseColor == [UIColor clearColor]) {
+                    // If no existing color, use black as the base (island default)
+                    baseColor = [UIColor blackColor];
+                }
+                targetSubview.backgroundColor = [baseColor colorWithAlphaComponent:alpha];
+
+                // Keep container alpha at 1.0 — this is the key fix.
+                // Setting alpha < 1 on a parent makes ALL children inherit it,
+                // causing the black child backgrounds to composite weirdly.
+                targetSubview.alpha = 1.0;
+
+                // Ensure no black bleeds from child glyph views
+                clearOpaqueBlackSubviewBackgrounds(targetSubview);
             }
         }
-    } if (lineDisabled) {
+    }
+
+    if (lineDisabled) {
         if (self.subviews.count == 4) {
             UIView *lineView = self.subviews[1];
             if (lineView.alpha == 1.0 && lineView.userInteractionEnabled == 0) {
@@ -496,7 +595,7 @@ static BOOL lineDisabled;
         } else if ([deviceModel isEqualToString:@"iPhone11,6"]) { //XS Max
             %orig;
             return CGRectMake(xNot, yNot, 414, 896);
-        } else if ([deviceModel isEqualToString:@"iPhone12,5"]) { //11
+        } else if ([deviceModel isEqualToString:@"iPhone12,5"]) { //11 Pro Max
             %orig;
             return CGRectMake(xNot, yNot, 414, 896);
 
